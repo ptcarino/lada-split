@@ -18,6 +18,7 @@ Note that this does not guarantee mitigation of GPU memory fragmentation or OOM 
 - `ffmpeg` and `ffprobe` in PATH (Linux)
 - [LadaApp](https://github.com/ladaapp/lada) installed with a working `lada-cli`
 - AMD GPU with ROCm support (script is configured for ROCm on WSL2)
+- `rich` Python library (`pip3 install rich --user`)
 - **Optional**: `ffmpeg.exe` (Windows) in PATH for GPU-accelerated downscale/upscale via AMF. The Gyan.dev full build includes AMF support. If not available, the script falls back to Linux ffmpeg with software scaling automatically.
 
 ---
@@ -41,8 +42,8 @@ Edit the config section at the top of the script to match your system:
 ```python
 CHUNK_DURATION = 600            # seconds per chunk (default: 10 minutes)
 LADA_FIXED_ARGS = ["--fp16", "--mosaic-detection-model", "v4-accurate"]
-MODEL_WEIGHTS_DIR = "/home/<user>/lada/model_weights"
-LADA_VENV_BIN = "/home/<user>/lada/.venv/bin/lada-cli"
+MODEL_WEIGHTS_DIR = "/path/to/lada/model_weights"
+LADA_VENV_BIN = "/path/to/lada/.venv/bin/lada-cli"
 TEMP_BASE = Path("/path/to/lada_tmp")        # where temp/chunk files are stored
 STATE_DIR = Path("/path/to/lada_tmp/.lada_state")  # where job state is saved
 SHUTDOWN_COUNTDOWN = 300        # seconds before auto-shutdown (default: 5 minutes)
@@ -104,13 +105,51 @@ lada-split --input video.mp4 --output /path/to/output.mp4 --pre-downscale
 
 # Specific resolution
 lada-split --input video.mp4 --output /path/to/output.mp4 --pre-downscale 540p
+
+# Custom upscale output resolution
+lada-split --input video.mp4 --output /path/to/output.mp4 --pre-downscale --output-res 1920x1080
+
+# Skip upscale — output stays at downscaled resolution
+lada-split --input video.mp4 --output /path/to/output.mp4 --pre-downscale --skip-upscale
 ```
 
-### Shutdown after completion
+### Remove a job
+
+Remove all temporary files and state for a specific job ID:
 
 ```bash
-lada-split --input video.mp4 --output /path/to/output.mp4 --shutdown-after
+lada-split --remove-job <job_id>
 ```
+
+This is a standalone operation — no other flags are needed. It removes the work directory, state file, and log file for the given job ID, and prints each item as it is deleted. The original input file is not touched.
+
+The `job_id` is printed at the start of every run.
+
+### Delete input after completion
+
+```bash
+lada-split --input video.mp4 --output /path/to/output.mp4 --delete-input
+```
+
+Only deletes the original input file if all chunks completed successfully. If any chunks failed, the input file is preserved.
+
+---
+
+## Flags reference
+
+| Flag | Shortcut | Argument | Description |
+|------|----------|----------|-------------|
+| `--input` | `-i` | `FILE` | Input video file. Mutually exclusive with `--input-dir`. |
+| `--input-dir` | — | `DIR` | Process all `.mp4` files in a directory sequentially. Mutually exclusive with `--input`. |
+| `--output` | `-o` | `FILE` | Output video file path. Required with `--input` unless `--output-dir` is used. |
+| `--output-dir` | — | `DIR` | Output directory. Uses `--output-pattern` for filenames. |
+| `--output-pattern` | `-p` | `PATTERN` | Output filename pattern using `{orig_file_name}` placeholder. Extension taken from source. Default: `{orig_file_name}-MR`. |
+| `--pre-downscale` | — | `[RESOLUTION]` | Downscale input before processing. Defaults to `720p` if no value given. |
+| `--output-res` | — | `WxH` | Override upscale output resolution (e.g. `1920x1080`). Only valid with `--pre-downscale`. |
+| `--skip-upscale` | — | — | Skip upscale step after processing. Output stays at downscaled resolution. Only valid with `--pre-downscale`. Mutually exclusive with `--output-res`. |
+| `--delete-input` | — | — | Delete original input file after successful completion. Only when all chunks succeed. |
+| `--shutdown-after` | — | — | Shut down Windows after successful completion, within configured time window. |
+| `--remove-job` | `-r` | `JOB_ID` | Remove all temp files and state for a job. Standalone operation. |
 
 ---
 
@@ -133,44 +172,61 @@ After each chunk is processed, the script verifies:
 If validation fails, the chunk is retried once before being marked as failed.
 
 ### Pre-downscale / upscale
-When `--pre-downscale` is specified, the input video is downscaled to the target resolution before splitting into chunks. After concatenation, the output is upscaled back to the original input resolution. This reduces VRAM usage during lada-cli processing at the cost of some image sharpness.
+When `--pre-downscale` is specified, the input video is downscaled to the target resolution before splitting into chunks. After concatenation, the output is upscaled back to the original input resolution by default, or to a custom resolution if `--output-res WxH` is specified.
+
+Use `--skip-upscale` to skip the upscale step entirely — the concatenated downscaled file is written directly to the output path. This is useful when you intend to run the output through an external AI upscaler separately.
 
 If `ffmpeg.exe` (Windows) is available in PATH, both steps use GPU-accelerated AMF scaling via `vpp_amf`: `h264_amf` for the downscale intermediate and `hevc_amf` for the final upscale output. If `ffmpeg.exe` is not available, both steps fall back to Linux ffmpeg with the Lanczos software scaler.
 
 Accepted values: `720p`, `540p`, `480p`, etc. Defaults to `720p` if no value is given. If the input is already at or below the target resolution, the downscale step is skipped automatically.
 
+### Input validation
+The script validates argument combinations before processing starts and exits with a clear error message if:
+- `--input` file does not exist
+- `--output-pattern` appears to contain a flag (missing space between arguments)
+- `--output-pattern` contains a path separator (`/` or `\`) — use `--output-dir` for the directory
+- `--skip-upscale` is used without `--pre-downscale`
+- `--output-res` is used without `--pre-downscale`
+- `--output-res` and `--skip-upscale` are used together
+- `--output-res` is not in `WxH` format with valid positive integers
+
 ### Shutdown after completion
 When `--shutdown-after` is specified, the script will trigger a Windows shutdown after successful completion — but only if the current time is within the configured window (default: 03:00–07:00). A countdown is shown before shutdown, and pressing any key cancels it. Configurable via `SHUTDOWN_COUNTDOWN`, `SHUTDOWN_WINDOW_START`, and `SHUTDOWN_WINDOW_END` in the config section.
 
+### Delete input after completion
+When `--delete-input` is specified, the original input file is deleted after successful completion. Only applies when all chunks completed without failure — if any chunks failed, the input file is preserved. Works in both `--input` and `--input-dir` modes.
+
+### Remove a job
+`--remove-job <job_id>` is a standalone operation that removes all temporary files and state for a given job — work directory, state file, and log file. Prints each item as it is deleted. The original input file is not touched.
+
 ### Progress display
-A live-updating progress display shows:
+A live-updating progress display powered by `rich` shows the current pipeline phase, overall progress, and per-chunk progress:
+
 ```
-────────────────────────────────────────────────────────────────────────
-  Overall  [████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  30.0%  65,940/219,803 frames  ETA 0:45:12
-  Chunk 3/9  [██████████████░░░░░░░░░░░░░░░░]  46.5%  12,561/27,000 frames  13.0 fps  Elapsed 0:16:42
-────────────────────────────────────────────────────────────────────────
-  Q = clean exit    F = forced exit
+  Phase: Processing chunks (3/9)
+  Overall              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   30.0%  65,940/219,803 frames  13.0 fps  0:16:42  ETA 0:45:12
+  Chunk 3/9            ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━   46.5%  12,561/27,000 frames   13.0 fps  0:16:42  ETA 0:12:30
+  Q + Enter = clean exit    F + Enter = forced exit
 ```
 
-The display adapts to the terminal width automatically.
+The phase indicator updates as the pipeline moves through stages: Downscaling → Processing chunks → Concatenating → Upscaling. The display adapts to terminal width automatically.
 
 ### Quit keys
-Press during processing (case-insensitive):
+Press during chunk processing (followed by Enter):
 
 | Key | Behaviour |
 |-----|-----------|
-| `Q` | Clean exit — sends SIGTERM to lada-cli, waits up to 30s, saves state |
-| `F` | Forced exit — sends SIGKILL immediately, saves state |
+| `Q` + Enter | Clean exit — sends SIGTERM to lada-cli, waits up to 30s, saves state |
+| `F` + Enter | Forced exit — sends SIGKILL immediately, saves state |
 
 Both print an exit summary on quit:
 ```
-────────────────────────────────────────────────────────────────────────
-  Exit summary
-  Total elapsed:    0:42:15
-  Chunks completed: 1, 3, 4, 5
-  Chunks failed:    2
-  Chunks remaining: 6, 7, 8, 9
-────────────────────────────────────────────────────────────────────────
+╭─────────────────────── Exit summary ───────────────────────────╮
+│ Total elapsed:     0:42:15                                      │
+│ Chunks completed:  1, 3, 4, 5                                   │
+│ Chunks failed:     2                                            │
+│ Chunks remaining:  6, 7, 8, 9                                   │
+╰─────────────────────────────────────────────────────────────────╯
 ```
 
 ---

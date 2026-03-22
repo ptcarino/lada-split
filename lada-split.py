@@ -5,8 +5,8 @@ Splits a video into chunks, runs lada-cli on each with resume support,
 then concatenates the results.
 
 Usage:
-    lada-split --input video.mp4 --output /mnt/e/lada_exports/output.mp4
-    lada-split --input video.mp4 --output /mnt/e/lada_exports/output.mp4 --max-clip-length 120
+    lada-split --input video.mp4 --output /path/to/output.mp4
+    lada-split --input video.mp4 --output /path/to/output.mp4 --max-clip-length 120
 
 Keys during processing:
     Q — clean exit (waits for current frame, saves state)
@@ -31,6 +31,26 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Thread
 
+from rich.console import Console
+from rich.live import Live
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
+from rich.text import Text
+from rich.console import Group
+
+console = Console(force_terminal=True)
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 CHUNK_DURATION = 600            # 10 minutes in seconds
 LADA_FIXED_ARGS = ["--fp16", "--mosaic-detection-model", "v4-accurate"]
@@ -42,6 +62,8 @@ STATE_DIR = Path("/mnt/f/lada_tmp/.lada_state")
 SHUTDOWN_COUNTDOWN = 300        # seconds before auto-shutdown (default: 5 minutes)
 SHUTDOWN_WINDOW_START = 3       # earliest hour shutdown is allowed (03:00)
 SHUTDOWN_WINDOW_END = 7         # latest hour shutdown is allowed (07:00)
+
+OUTPUT_PATTERN_DEFAULT = "{orig_file_name}-MR"
 
 ROCM_ENV = {
     "PYTORCH_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.5,max_split_size_mb:128",
@@ -56,42 +78,47 @@ QUIT_CLEAN = False
 QUIT_FORCE = False
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-def setup_logging(log_path: Path):
-    class TruncatingStreamHandler(logging.StreamHandler):
-        def emit(self, record):
-            try:
-                msg = self.format(record)
-                try:
-                    width = os.get_terminal_size().columns
-                except OSError:
-                    width = 80
-                # Truncate to terminal width to prevent wrapping
-                if len(msg) > width:
-                    msg = msg[:width - 1]
-                self.stream.write(msg + "\r\n")
-                self.flush()
-            except Exception:
-                self.handleError(record)
+_file_handler = None  # current per-job file handler
 
-    stream_handler = TruncatingStreamHandler(sys.stdout)
-    formatter = logging.Formatter(
-        "[%(asctime)s] %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    stream_handler.setFormatter(formatter)
-
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setFormatter(formatter)
-
+def setup_logging():
+    """Called once at startup — sets up the console handler via rich."""
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    root.addHandler(stream_handler)
-    root.addHandler(file_handler)
+    rich_handler = RichHandler(
+        console=console,
+        show_time=True,
+        show_level=True,
+        show_path=False,
+        markup=False,
+        rich_tracebacks=False,
+    )
+    rich_handler.setFormatter(logging.Formatter("%(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    root.addHandler(rich_handler)
 
     fl = logging.getLogger("file_only")
     fl.setLevel(logging.DEBUG)
     fl.propagate = False
-    fl.addHandler(file_handler)
+
+def setup_job_logging(log_path: Path):
+    """Called once per job — attaches a new file handler and removes the old one."""
+    global _file_handler
+    formatter = logging.Formatter(
+        "[%(asctime)s] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root = logging.getLogger()
+    fl = logging.getLogger("file_only")
+
+    # Remove previous file handler if present
+    if _file_handler is not None:
+        root.removeHandler(_file_handler)
+        fl.removeHandler(_file_handler)
+        _file_handler.close()
+
+    _file_handler = logging.FileHandler(log_path)
+    _file_handler.setFormatter(formatter)
+    root.addHandler(_file_handler)
+    fl.addHandler(_file_handler)
 
 log = logging.getLogger(__name__)
 file_logger = logging.getLogger("file_only")
@@ -186,8 +213,6 @@ def maybe_shutdown(countdown: int = SHUTDOWN_COUNTDOWN):
                 sys.stdin.read(1)
                 print("\r\n  Shutdown cancelled.\r")
                 return
-            else:
-                time.sleep(1)
     finally:
         if fd is not None and old_settings is not None:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -200,21 +225,17 @@ def keypress_listener():
     global QUIT_CLEAN, QUIT_FORCE
     if not sys.stdin.isatty():
         return
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        while True:
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                ch = sys.stdin.read(1).lower()
-                if ch == 'q':
-                    QUIT_CLEAN = True
-                    return
-                elif ch == 'f':
-                    QUIT_FORCE = True
-                    return
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    while True:
+        try:
+            line = sys.stdin.readline().strip().lower()
+        except (EOFError, OSError):
+            return
+        if line == 'q':
+            QUIT_CLEAN = True
+            return
+        elif line == 'f':
+            QUIT_FORCE = True
+            return
 
 # ─── Exit summary ─────────────────────────────────────────────────────────────
 def print_summary(chunks: list, completed: set, failed: set, start_time: float):
@@ -224,101 +245,139 @@ def print_summary(chunks: list, completed: set, failed: set, start_time: float):
     completed_nums = [str(i+1) for i, c in enumerate(chunks) if str(c) in completed]
     failed_nums = [str(i+1) for i, c in enumerate(chunks) if str(c) in failed]
 
-    print()
-    print("─" * 72)
-    print("  Exit summary")
-    print(f"  Total elapsed:    {fmt_duration(elapsed)}")
-    print(f"  Chunks completed: {', '.join(completed_nums) if completed_nums else 'none'}")
-    print(f"  Chunks failed:    {', '.join(failed_nums) if failed_nums else 'none'}")
-    print(f"  Chunks remaining: {', '.join(remaining) if remaining else 'none'}")
-    print("─" * 72)
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="bold")
+    table.add_column()
+    table.add_row("Total elapsed:",    fmt_duration(elapsed))
+    table.add_row("Chunks completed:", ", ".join(completed_nums) if completed_nums else "none")
+    table.add_row("Chunks failed:",    ", ".join(failed_nums) if failed_nums else "none")
+    table.add_row("Chunks remaining:", ", ".join(remaining) if remaining else "none")
+    console.print(Panel(table, title="Exit summary", border_style="dim"))
 
 # ─── Progress display ─────────────────────────────────────────────────────────
-DISPLAY_LINES = 5
+def _make_progress() -> Progress:
+    """Create a Progress instance with shared column layout."""
+    return Progress(
+        TextColumn("  [bold]{task.description:<20}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        TextColumn("[cyan]{task.completed:,}[/cyan]/[cyan]{task.total:,}[/cyan] frames"),
+        TextColumn("[green]{task.fields[fps]:.1f} fps[/green]"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        expand=True,
+    )
+
+def ffmpeg_with_progress(cmd: list, total_frames: int, label: str):
+    """Run an ffmpeg command and show a single-bar Live progress display."""
+    cmd = cmd + ["-progress", "pipe:1", "-nostats"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    progress = _make_progress()
+    task = progress.add_task(label, total=total_frames, fps=0.0)
+    frames_done = 0
+    start_time = time.time()
+
+    with Live(progress, console=console, refresh_per_second=10):
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("frame="):
+                try:
+                    frames_done = int(line.split("=")[1])
+                except ValueError:
+                    pass
+                elapsed = time.time() - start_time
+                fps = frames_done / elapsed if elapsed > 0 and frames_done > 0 else 0.0
+                progress.update(task, completed=frames_done, fps=fps)
+
+    proc.wait()
+    if proc.returncode != 0:
+        err = proc.stderr.read()
+        log.error(f"ffmpeg failed:\n{err}")
+        sys.exit(1)
 
 class ProgressTracker:
-    def __init__(self, total_chunks: int, total_frames: int):
+    """Two-bar progress display for chunk processing using Live.
+    Call start() before the chunk loop, stop() after."""
+
+    def __init__(self, total_chunks: int, total_frames: int, completed_frames: int = 0):
         self.total_chunks = total_chunks
         self.total_frames = total_frames
-        self.completed_frames = 0
+        self.completed_frames = completed_frames
         self.current_chunk = 0
         self.current_chunk_frames = 0
         self.start_time = time.time()
         self.chunk_start_time = time.time()
-        self._initialized = False
+        self._progress: Progress | None = None
+        self._live: Live | None = None
+        self._overall_task = None
+        self._chunk_task = None
+        self._phase_text = Text("  Phase: Initializing", style="bold cyan")
+
+    def set_phase(self, phase: str):
+        self._phase_text = Text(f"  Phase: {phase}", style="bold cyan")
+        if self._live is not None:
+            self._live.update(Group(self._phase_text, self._progress))
+
+    def start(self):
+        """Start the two-bar Live display. Call once before the chunk loop begins."""
+        self._progress = _make_progress()
+        self._overall_task = self._progress.add_task(
+            "Overall",
+            total=self.total_frames,
+            completed=self.completed_frames,
+            fps=0.0,
+        )
+        self._chunk_task = self._progress.add_task(
+            "Chunk -/-",
+            total=1,
+            completed=0,
+            fps=0.0,
+        )
+        self._live = Live(
+            Group(self._phase_text, self._progress),
+            console=console,
+            refresh_per_second=10,
+        )
+        self._live.start()
+        self._live.console.print("  [dim]Q + Enter = clean exit    F + Enter = forced exit[/dim]")
 
     def start_chunk(self, chunk_num: int, chunk_frames: int):
         self.current_chunk = chunk_num
         self.current_chunk_frames = chunk_frames
         self.chunk_start_time = time.time()
+        if self._progress is not None:
+            self._progress.reset(
+                self._chunk_task,
+                total=chunk_frames,
+                description=f"Chunk {chunk_num}/{self.total_chunks}",
+            )
 
     def complete_chunk(self, chunk_frames: int):
         self.completed_frames += chunk_frames
 
+    def print_initial(self):
+        # No-op — Live display is started explicitly via start()
+        pass
+
     def render(self, chunk_frames_done: int, chunk_total: int):
+        if self._progress is None or self._live is None:
+            return
         now = time.time()
         elapsed_total = now - self.start_time
         overall_done = self.completed_frames + chunk_frames_done
-
-        if overall_done > 0:
-            rate = overall_done / elapsed_total
-            remaining_frames = self.total_frames - overall_done
-            eta = remaining_frames / rate if rate > 0 else 0
-        else:
-            eta = 0
-
-        overall_pct = overall_done / self.total_frames if self.total_frames > 0 else 0
-        chunk_pct = chunk_frames_done / chunk_total if chunk_total > 0 else 0
+        overall_fps = overall_done / elapsed_total if elapsed_total > 0 and overall_done > 0 else 0.0
         chunk_elapsed = now - self.chunk_start_time
-        chunk_fps = chunk_frames_done / chunk_elapsed if chunk_elapsed > 0 and chunk_frames_done > 0 else 0
+        chunk_fps = chunk_frames_done / chunk_elapsed if chunk_elapsed > 0 and chunk_frames_done > 0 else 0.0
+        self._progress.update(self._overall_task, completed=overall_done, fps=overall_fps)
+        self._progress.update(self._chunk_task, completed=chunk_frames_done, fps=chunk_fps)
 
-        # Adapt bar widths to terminal width
-        try:
-            term_width = max(40, os.get_terminal_size().columns)
-        except OSError:
-            term_width = 80
-        sep = "─" * term_width
-
-        # Overall line: fixed text length ~40 chars, give rest to bar
-        overall_suffix = (f" {overall_pct*100:5.1f}%"
-                          f"  {fmt_frames(overall_done)}/{fmt_frames(self.total_frames)} frames"
-                          f"  ETA {fmt_duration(eta)}")
-        overall_prefix = "  Overall  ["
-        overall_bar_width = max(10, term_width - len(overall_prefix) - 1 - len(overall_suffix) - 2)
-        overall_bar = self._bar(overall_pct, width=overall_bar_width)
-
-        # Chunk line: fixed text length ~50 chars, give rest to bar
-        chunk_suffix = (f" {chunk_pct*100:5.1f}%"
-                        f"  {fmt_frames(chunk_frames_done)}/{fmt_frames(chunk_total)} frames"
-                        f"  {chunk_fps:.1f} fps"
-                        f"  Elapsed {fmt_duration(chunk_elapsed)}")
-        chunk_prefix = f"  Chunk {self.current_chunk}/{self.total_chunks}  ["
-        chunk_bar_width = max(10, term_width - len(chunk_prefix) - 1 - len(chunk_suffix) - 2)
-        chunk_bar = self._bar(chunk_pct, width=chunk_bar_width)
-
-        lines = [
-            sep,
-            f"{overall_prefix}{overall_bar}]{overall_suffix}",
-            f"{chunk_prefix}{chunk_bar}]{chunk_suffix}",
-            sep,
-            "  Q = clean exit    F = forced exit",
-        ]
-
-        if self._initialized:
-            sys.stdout.write(f"\033[{DISPLAY_LINES}A")
-        else:
-            self._initialized = True
-
-        sys.stdout.write("\r\n".join(lines) + "\r\n")
-        sys.stdout.flush()
-
-    def _bar(self, pct: float, width: int = 40) -> str:
-        filled = int(width * pct)
-        return "█" * filled + "░" * (width - filled)
-
-    def print_initial(self):
-        sys.stdout.write("\r\n" * DISPLAY_LINES)
-        sys.stdout.flush()
+    def stop(self):
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+            self._progress = None
 
 # ─── Output validation ────────────────────────────────────────────────────────
 DURATION_TOLERANCE = 2.0
@@ -381,60 +440,6 @@ def get_video_resolution(path: Path) -> tuple[int, int]:
         return int(w), int(h)
     except Exception:
         return 0, 0
-
-def ffmpeg_with_progress(cmd: list, total_frames: int, label: str):
-    """Run an ffmpeg command and show a live progress bar."""
-    cmd = cmd + ["-progress", "pipe:1", "-nostats"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    try:
-        term_width = max(40, os.get_terminal_size().columns)
-    except OSError:
-        term_width = 80
-
-    initialized = False
-    frames_done = 0
-    start_time = time.time()
-
-    def render():
-        pct = frames_done / total_frames if total_frames > 0 else 0
-        elapsed = time.time() - start_time
-        fps = frames_done / elapsed if elapsed > 0 and frames_done > 0 else 0
-        eta = (total_frames - frames_done) / fps if fps > 0 and total_frames > 0 else 0
-
-        suffix = f" {pct*100:5.1f}%  {fmt_frames(frames_done)}/{fmt_frames(total_frames)} frames  {fps:.1f} fps  ETA {fmt_duration(eta)}"
-        prefix = f"  {label}  ["
-        bar_width = max(10, term_width - len(prefix) - 1 - len(suffix) - 2)
-        filled = int(bar_width * pct)
-        bar = "█" * filled + "░" * (bar_width - filled)
-
-        nonlocal initialized
-        if initialized:
-            sys.stdout.write("\033[2A")
-        else:
-            initialized = True
-
-        sys.stdout.write(f"{'─' * term_width}\r\n")
-        sys.stdout.write(f"{prefix}{bar}]{suffix}\r\n")
-        sys.stdout.flush()
-
-    for line in proc.stdout:
-        line = line.strip()
-        if line.startswith("frame="):
-            try:
-                frames_done = int(line.split("=")[1])
-                render()
-            except ValueError:
-                pass
-
-    proc.wait()
-    sys.stdout.write(f"{'─' * term_width}\r\n")
-    sys.stdout.flush()
-
-    if proc.returncode != 0:
-        err = proc.stderr.read()
-        log.error(f"ffmpeg failed:\n{err}")
-        sys.exit(1)
 
 def downscale_video(input_path: Path, output_path: Path, target_height: int):
     log.info(f"Downscaling to {target_height}p -> {output_path.name}...")
@@ -542,12 +547,16 @@ def run_lada(chunk: Path, output: Path, work_dir: Path, extra_args: list,
         proc.wait()
 
         if error_lines:
-            print()
             for err in error_lines[-5:]:
                 log.error(err)
 
         return proc.returncode == 0, error_lines
 
+    except KeyboardInterrupt:
+        proc.kill()
+        proc.wait()
+        log.info("Interrupted.")
+        return False, []
     except Exception as e:
         log.error(f"Exception running lada-cli: {e}")
         return False, []
@@ -570,8 +579,6 @@ def concatenate(restored_chunks: list, output: Path, work_dir: Path):
     log.info(f"Output saved to: {output}")
 
 # ─── Output path resolution ───────────────────────────────────────────────────
-OUTPUT_PATTERN_DEFAULT = "{orig_file_name}-MR"
-
 def resolve_output_path(input_path: Path, output: str | None, output_dir: str | None, output_pattern: str | None) -> Path:
     """Resolve the output path from --output or --output-dir + --output-pattern."""
     if output:
@@ -597,13 +604,13 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
     state_file = STATE_DIR / f"{job_id}.json"
     log_file = STATE_DIR / f"{job_id}.log"
 
-    setup_logging(log_file)
+    setup_job_logging(log_file)
     log.info(f"Job ID: {job_id} ({input_path.name})")
     if FFMPEG_EXE:
         log.info(f"GPU scaling: Windows ffmpeg AMF detected ({FFMPEG_EXE})")
     else:
         log.info("GPU scaling: ffmpeg.exe not found — using Linux ffmpeg (software scale)")
-    log.info("Press Q for clean exit, F for forced exit.")
+    log.info("Press Q + Enter for clean exit, F + Enter for forced exit.")
 
     state = load_state(state_file)
     resuming = bool(state)
@@ -630,6 +637,7 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
             if abs(input_duration - downscaled_duration) > DURATION_TOLERANCE:
                 log.warning("Downscaled file is missing or incomplete. Re-running downscale...")
                 target_height = state.get("downscale_target_height", 720)
+                console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
                 downscale_video(input_path, downscaled_path, target_height)
                 log.info("Re-downscale complete. Resuming chunk processing.")
     else:
@@ -654,6 +662,7 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
                 if abs(input_duration - downscaled_duration) <= DURATION_TOLERANCE:
                     log.info("Existing downscaled file is valid. Skipping downscale.")
                 else:
+                    console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
                     downscale_video(input_path, downscaled_path, target_height)
                 source_for_split = downscaled_path
 
@@ -678,10 +687,8 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
 
     total_frames = sum(chunk_frames.values())
     total_chunks = len(chunks)
-    tracker = ProgressTracker(total_chunks, total_frames)
-
-    for c in completed:
-        tracker.completed_frames += chunk_frames.get(c, 0)
+    already_done = sum(chunk_frames.get(c, 0) for c in completed)
+    tracker = ProgressTracker(total_chunks, total_frames, already_done)
 
     log.info(f"Chunks: {total_chunks} | Total frames: {fmt_frames(total_frames)}")
     log.info(f"Completed: {len(completed)} | Remaining: {total_chunks - len(completed) - len(failed)}")
@@ -705,6 +712,8 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
         return True
 
     # Process chunks
+    tracker.start()
+    tracker.set_phase(f"Processing chunks (0/{total_chunks})")
     for idx, chunk in enumerate(chunks, start=1):
         if QUIT_CLEAN or QUIT_FORCE:
             break
@@ -718,6 +727,7 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
         restored = work_dir / f"restored_{chunk.name}"
         log.info(f"Processing chunk {idx}/{total_chunks}: {chunk.name}")
         frames = chunk_frames.get(chunk_key, 0)
+        tracker.set_phase(f"Processing chunks ({idx}/{total_chunks})")
 
         if attempt(chunk, restored, idx, frames, 1):
             log.info(f"Chunk {idx}/{total_chunks} completed.")
@@ -728,7 +738,6 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
             log.warning(f"Chunk {idx}/{total_chunks} failed. Retrying...")
             restored.unlink(missing_ok=True)
             tracker.start_chunk(idx, frames)
-            tracker.print_initial()
             if attempt(chunk, restored, idx, frames, 2):
                 log.info(f"Chunk {idx}/{total_chunks} succeeded on retry.")
                 tracker.complete_chunk(frames)
@@ -742,6 +751,8 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
         state["completed"] = list(completed)
         state["failed"] = list(failed)
         save_state(state_file, state)
+
+    tracker.stop()
 
     # Handle quit
     if QUIT_CLEAN or QUIT_FORCE:
@@ -764,16 +775,22 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
     ]
 
     if original_resolution:
-        # Concatenate to a temp file first, then upscale to final output
-        pre_upscale_path = work_dir / "output_pre_upscale.mp4"
-        concatenate(restored_chunks, pre_upscale_path, work_dir)
-        upscale_video(pre_upscale_path, output_path, original_resolution[0], original_resolution[1])
-
-        if args.keep_downscaled:
-            preserved_path = TEMP_BASE / f"{output_path.stem}_pre_upscale.mp4"
-            shutil.move(str(pre_upscale_path), str(preserved_path))
-            log.info(f"Pre-upscale file preserved at: {preserved_path}")
+        if args.skip_upscale:
+            console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
+            concatenate(restored_chunks, output_path, work_dir)
+            log.info("Upscale skipped — output is at downscaled resolution.")
+        else:
+            console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
+            pre_upscale_path = work_dir / "output_pre_upscale.mp4"
+            concatenate(restored_chunks, pre_upscale_path, work_dir)
+            if args.output_res:
+                out_w, out_h = [int(x) for x in args.output_res.split("x")]
+            else:
+                out_w, out_h = original_resolution[0], original_resolution[1]
+            console.print("  [bold cyan]Phase: Upscaling[/bold cyan]")
+            upscale_video(pre_upscale_path, output_path, out_w, out_h)
     else:
+        console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
         concatenate(restored_chunks, output_path, work_dir)
 
     # Cleanup
@@ -784,11 +801,21 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
     state_file.unlink(missing_ok=True)
 
     log.info("Done.")
+
+    if args.delete_input and not failed:
+        try:
+            input_path.unlink()
+            log.info(f"Deleted original input file: {input_path}")
+        except Exception as e:
+            log.warning(f"Could not delete input file: {e}")
+
     return True
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     global QUIT_CLEAN, QUIT_FORCE
+
+    setup_logging()
 
     parser = argparse.ArgumentParser(
         description="Split, restore with lada-cli, and concatenate video.",
@@ -796,16 +823,16 @@ def main():
     )
 
     # Input — mutually exclusive
-    input_group = parser.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("--input", help="Input video file")
+    input_group = parser.add_mutually_exclusive_group(required=False)
+    input_group.add_argument("-i", "--input", help="Input video file")
     input_group.add_argument("--input-dir", help="Directory of .mp4 files to process sequentially")
 
     # Output
-    parser.add_argument("--output",
+    parser.add_argument("-o", "--output",
                         help="Output video file path. Required with --input unless --output-dir is used.")
     parser.add_argument("--output-dir",
                         help="Output directory. Used with --output-pattern (or default pattern).")
-    parser.add_argument("--output-pattern", default=OUTPUT_PATTERN_DEFAULT,
+    parser.add_argument("-p", "--output-pattern", default=OUTPUT_PATTERN_DEFAULT,
                         metavar="PATTERN",
                         help=f"Output filename pattern using {{orig_file_name}} as placeholder. "
                              f"Extension is taken from the source file. "
@@ -815,15 +842,63 @@ def main():
                         type=str,
                         help="Downscale input to the given resolution before processing (e.g. 720p, 540p, 480p). "
                              "Defaults to 720p if no value given. Output will be upscaled back to original resolution.")
-    parser.add_argument("--keep-downscaled", action="store_true",
-                        help="Preserve the pre-upscale concatenated file in TEMP_BASE after processing. "
-                             "Only applies when --pre-downscale is used.")
+    parser.add_argument("--output-res", metavar="WxH",
+                        help="Override the upscale output resolution (e.g. 1920x1080). "
+                             "Only valid when --pre-downscale is used.")
+    parser.add_argument("--skip-upscale", action="store_true",
+                        help="Skip the upscale step after processing. The concatenated downscaled file "
+                             "is written directly to the output path. Only valid when --pre-downscale is used.")
     parser.add_argument("--shutdown-after", action="store_true",
                         help=f"Shut down Windows after successful completion "
                              f"(only between {SHUTDOWN_WINDOW_START:02d}:00–{SHUTDOWN_WINDOW_END:02d}:00, "
                              f"with a {SHUTDOWN_COUNTDOWN//60}-minute countdown)")
+    parser.add_argument("--delete-input", action="store_true",
+                        help="Delete the original input file after successful completion. "
+                             "Only applies when all chunks completed without failure.")
+    parser.add_argument("-r", "--remove-job", metavar="JOB_ID",
+                        help="Remove all temporary files and state for the given job ID. "
+                             "Standalone operation — no other flags required.")
 
     args, extra_args = parser.parse_known_args()
+
+    # ── Handle --remove-job standalone operation ───────────────────────────────
+    if args.remove_job:
+        job_id = args.remove_job
+        work_dir = TEMP_BASE / f"lada_{job_id}"
+        state_file = STATE_DIR / f"{job_id}.json"
+        log_file = STATE_DIR / f"{job_id}.log"
+        found_any = False
+
+        if work_dir.exists():
+            console.print(f"  Removing work directory: {work_dir}")
+            shutil.rmtree(work_dir)
+            found_any = True
+        else:
+            console.print(f"  Work directory not found (already clean): {work_dir}")
+
+        if state_file.exists():
+            console.print(f"  Removing state file: {state_file}")
+            state_file.unlink()
+            found_any = True
+        else:
+            console.print(f"  State file not found (already clean): {state_file}")
+
+        if log_file.exists():
+            console.print(f"  Removing log file: {log_file}")
+            log_file.unlink()
+            found_any = True
+        else:
+            console.print(f"  Log file not found (already clean): {log_file}")
+
+        if found_any:
+            console.print(f"\n  [green]Job {job_id} cleaned up.[/green]")
+        else:
+            console.print(f"\n  [yellow]No files found for job {job_id}.[/yellow]")
+        sys.exit(0)
+
+    # ── Validate input flags are present for normal operation ──────────────────
+    if not args.input and not args.input_dir:
+        parser.error("one of the arguments --input/--input-dir is required.")
 
     # ── Validate argument combinations ────────────────────────────────────────
     if args.input:
@@ -831,11 +906,33 @@ def main():
             parser.error("--input requires either --output or --output-dir.")
         if args.output and args.output_dir:
             parser.error("--output and --output-dir cannot be used together.")
+        if not Path(args.input).exists():
+            parser.error(f"Input file not found: {args.input}")
     if args.input_dir:
         if not args.output_dir:
             parser.error("--input-dir requires --output-dir.")
         if args.output:
             parser.error("--output cannot be used with --input-dir. Use --output-dir and --output-pattern instead.")
+    if args.output_pattern:
+        if "--" in args.output_pattern:
+            parser.error("--output-pattern appears to contain a flag. Did you forget a space between arguments?")
+        if "/" in args.output_pattern or "\\" in args.output_pattern:
+            parser.error("--output-pattern must be a filename stem, not a path. Use --output-dir for the directory.")
+    if args.skip_upscale and not args.pre_downscale:
+        parser.error("--skip-upscale requires --pre-downscale.")
+    if args.output_res:
+        if not args.pre_downscale:
+            parser.error("--output-res requires --pre-downscale.")
+        if args.skip_upscale:
+            parser.error("--output-res and --skip-upscale cannot be used together.")
+        if not re.fullmatch(r"\d+x\d+", args.output_res):
+            parser.error(f"--output-res must be in WxH format (e.g. 1920x1080), got: {args.output_res}")
+        try:
+            out_w, out_h = [int(x) for x in args.output_res.split("x")]
+            if out_w <= 0 or out_h <= 0:
+                raise ValueError
+        except ValueError:
+            parser.error(f"--output-res dimensions must be positive integers, got: {args.output_res}")
 
     # ── Collect input files ───────────────────────────────────────────────────
     if args.input:
