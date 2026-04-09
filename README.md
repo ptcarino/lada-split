@@ -37,6 +37,7 @@ LADA_FIXED_ARGS = [
 ]
 TEMP_BASE  = Path(r"F:\lada_tmp")        # where temp/chunk files are stored
 STATE_DIR  = Path(r"F:\lada_tmp\.lada_state")  # where job state is saved
+AUDIO_MUX_TIMEOUT     = 300     # seconds to wait after frames hit 100% before treating as hung
 SHUTDOWN_COUNTDOWN    = 300     # seconds before auto-shutdown (default: 5 minutes)
 SHUTDOWN_WINDOW_START = 3       # earliest hour shutdown is allowed (03:00)
 SHUTDOWN_WINDOW_END   = 7       # latest hour shutdown is allowed (07:00)
@@ -171,6 +172,9 @@ Job state is saved to a JSON file keyed by the MD5 hash of the input file path. 
 
 ### Output validation
 After processing, the script verifies the output file exists and its duration matches the source within a 2-second tolerance. In chunked mode, a failed chunk is retried once before being marked as failed.
+
+### Audio mux hang detection
+lada-cli reports frame progress but goes silent during the final audio mux step after hitting 100%. If lada-cli is still running `AUDIO_MUX_TIMEOUT` seconds (default: 5 minutes) after frames complete, the script kills the process and runs extended validation on the output file. Extended validation checks: file size stability (not still being written), duration match, presence of audio stream (if source has audio), and minimum file size (at least 10% of source). If all checks pass the output is accepted as successful; if any fail the output is discarded and retried.
 
 ### Pre-downscale / upscale
 When `--pre-downscale` is specified, the input video is downscaled to the target resolution before processing. After completion, the output is upscaled back to the original input resolution by default, or to a custom resolution if `--output-res WxH` is specified.

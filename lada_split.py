@@ -6,6 +6,9 @@ Splits a video into chunks, runs lada-cli.exe on each with resume support,
 then concatenates the results. Use --no-chunk to skip splitting and process
 the whole video in one shot.
 
+Can also be imported as a library by lada-split-gui.py — all processing
+functions accept optional callbacks for progress and phase updates.
+
 Usage:
     python lada-split.py --input video.mp4 --output C:\\path\\to\\output.mp4
     python lada-split.py --input video.mp4 --output C:\\path\\to\\output.mp4 --no-chunk
@@ -19,7 +22,6 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -50,9 +52,9 @@ console = Console(force_terminal=True)
 # ─── Config ───────────────────────────────────────────────────────────────────
 CHUNK_DURATION = 600            # 10 minutes in seconds
 
-LADA_CLI       = Path(r"F:\lada\lada-cli.exe")
+LADA_CLI        = Path(r"F:\lada\lada-cli.exe")
 LADA_FIXED_ARGS = [
-    "--mosaic-detection-model",  "v4-accurate",
+    "--mosaic-detection-model",   "v4-accurate",
     "--mosaic-restoration-model", "basicvsrpp-v1.2",
     "--encoding-preset",          "hevc-amd-gpu-hq",
 ]
@@ -60,11 +62,11 @@ LADA_FIXED_ARGS = [
 TEMP_BASE  = Path(r"F:\lada_tmp")
 STATE_DIR  = Path(r"F:\lada_tmp\.lada_state")
 
-AUDIO_MUX_TIMEOUT    = 300      # seconds to wait after frames hit 100% before treating as hung
+AUDIO_MUX_TIMEOUT     = 300    # seconds to wait after frames hit 100% before treating as hung
 
-SHUTDOWN_COUNTDOWN   = 300      # seconds before auto-shutdown (default: 5 minutes)
-SHUTDOWN_WINDOW_START = 3       # earliest hour shutdown is allowed (03:00)
-SHUTDOWN_WINDOW_END   = 7       # latest hour shutdown is allowed (07:00)
+SHUTDOWN_COUNTDOWN    = 300    # seconds before auto-shutdown (default: 5 minutes)
+SHUTDOWN_WINDOW_START = 3      # earliest hour shutdown is allowed (03:00)
+SHUTDOWN_WINDOW_END   = 7      # latest hour shutdown is allowed (07:00)
 
 OUTPUT_PATTERN_DEFAULT = "{orig_file_name}-MR"
 
@@ -119,19 +121,18 @@ file_logger = logging.getLogger("file_only")
 
 # ─── ffmpeg detection ─────────────────────────────────────────────────────────
 def detect_ffmpeg() -> str:
-    """Return 'ffmpeg' if ffmpeg is on PATH, else exit with error."""
-    result = subprocess.run(
-        ["where.exe", "ffmpeg"],
-        capture_output=True, text=True,
-    )
+    """Return path to ffmpeg if on PATH, else raise RuntimeError."""
+    result = subprocess.run(["where.exe", "ffmpeg"], capture_output=True, text=True)
     if result.returncode == 0:
-        # where.exe may return multiple lines; take the first
-        path = result.stdout.strip().splitlines()[0].strip()
-        return path
-    log.error("ffmpeg not found on PATH. Please install ffmpeg and ensure it is on PATH.")
-    sys.exit(1)
+        return result.stdout.strip().splitlines()[0].strip()
+    raise RuntimeError("ffmpeg not found on PATH. Please install ffmpeg and ensure it is on PATH.")
 
-FFMPEG = detect_ffmpeg()
+try:
+    FFMPEG = detect_ffmpeg()
+    _FFMPEG_ERROR = None
+except RuntimeError as _e:
+    FFMPEG = None
+    _FFMPEG_ERROR = str(_e)
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def input_hash(input_path: Path) -> str:
@@ -139,8 +140,17 @@ def input_hash(input_path: Path) -> str:
 
 def load_state(state_file: Path) -> dict:
     if state_file.exists():
-        with open(state_file) as f:
-            return json.load(f)
+        try:
+            with open(state_file) as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            log.warning(f"State file is corrupt and will be ignored: {state_file} ({e})")
+            corrupt_path = state_file.with_suffix(".json.corrupt")
+            try:
+                state_file.rename(corrupt_path)
+                log.warning(f"Corrupt state file preserved at: {corrupt_path}")
+            except Exception:
+                pass
     return {}
 
 def save_state(state_file: Path, state: dict):
@@ -216,8 +226,7 @@ def maybe_shutdown(countdown: int = SHUTDOWN_COUNTDOWN):
         except Exception:
             pass
 
-    cancel_thread = Thread(target=wait_for_cancel, daemon=True)
-    cancel_thread.start()
+    Thread(target=wait_for_cancel, daemon=True).start()
 
     for remaining in range(countdown, 0, -1):
         if cancelled[0]:
@@ -254,9 +263,9 @@ def keypress_listener():
 
 # ─── Exit summary ─────────────────────────────────────────────────────────────
 def print_summary(chunks: list, completed: set, failed: set, start_time: float):
-    elapsed = time.time() - start_time
-    remaining     = [str(i+1) for i, c in enumerate(chunks)
-                     if str(c) not in completed and str(c) not in failed]
+    elapsed        = time.time() - start_time
+    remaining      = [str(i+1) for i, c in enumerate(chunks)
+                      if str(c) not in completed and str(c) not in failed]
     completed_nums = [str(i+1) for i, c in enumerate(chunks) if str(c) in completed]
     failed_nums    = [str(i+1) for i, c in enumerate(chunks) if str(c) in failed]
 
@@ -269,7 +278,7 @@ def print_summary(chunks: list, completed: set, failed: set, start_time: float):
     table.add_row("Chunks remaining:", ", ".join(remaining)      if remaining      else "none")
     console.print(Panel(table, title="Exit summary", border_style="dim"))
 
-# ─── Progress display ─────────────────────────────────────────────────────────
+# ─── Progress display (CLI) ───────────────────────────────────────────────────
 def _make_progress() -> Progress:
     return Progress(
         TextColumn("  [bold]{task.description:<20}"),
@@ -283,17 +292,16 @@ def _make_progress() -> Progress:
         expand=True,
     )
 
-def ffmpeg_with_progress(cmd: list, total_frames: int, label: str):
-    """Run an ffmpeg command and show a single-bar Live progress display."""
-    cmd = cmd + ["-progress", "pipe:1", "-nostats"]
+def ffmpeg_with_progress(cmd: list, total_frames: int, label: str, on_progress=None):
+    """Run an ffmpeg command with progress reporting.
+    on_progress(frames_done, total_frames) — if provided, used instead of rich display."""
+    cmd  = cmd + ["-progress", "pipe:1", "-nostats"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    progress = _make_progress()
-    task = progress.add_task(label, total=total_frames, fps=0.0)
     frames_done = 0
-    start_time = time.time()
+    start_time  = time.time()
 
-    with Live(progress, console=console, refresh_per_second=10):
+    if on_progress:
         for line in proc.stdout:
             line = line.strip()
             if line.startswith("frame="):
@@ -301,56 +309,70 @@ def ffmpeg_with_progress(cmd: list, total_frames: int, label: str):
                     frames_done = int(line.split("=")[1])
                 except ValueError:
                     pass
-                elapsed = time.time() - start_time
-                fps = frames_done / elapsed if elapsed > 0 and frames_done > 0 else 0.0
-                progress.update(task, completed=frames_done, fps=fps)
+                on_progress(frames_done, total_frames)
+        proc.wait()
+    else:
+        progress = _make_progress()
+        task     = progress.add_task(label, total=total_frames, fps=0.0)
+        with Live(progress, console=console, refresh_per_second=10):
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("frame="):
+                    try:
+                        frames_done = int(line.split("=")[1])
+                    except ValueError:
+                        pass
+                    elapsed = time.time() - start_time
+                    fps = frames_done / elapsed if elapsed > 0 and frames_done > 0 else 0.0
+                    progress.update(task, completed=frames_done, fps=fps)
+        proc.wait()
 
-    proc.wait()
     if proc.returncode != 0:
         err = proc.stderr.read()
-        log.error(f"ffmpeg failed:\n{err}")
-        sys.exit(1)
+        raise RuntimeError(f"ffmpeg failed:\n{err}")
 
 class ProgressTracker:
-    """Two-bar progress display for chunk processing using Live."""
+    """Two-bar progress display for chunk processing.
+    Accepts optional callbacks for GUI integration — when set, rich display is skipped."""
 
-    def __init__(self, total_chunks: int, total_frames: int, completed_frames: int = 0):
-        self.total_chunks      = total_chunks
-        self.total_frames      = total_frames
-        self.completed_frames  = completed_frames
-        self.current_chunk     = 0
+    def __init__(self, total_chunks: int, total_frames: int, completed_frames: int = 0,
+                 on_progress=None, on_phase=None):
+        self.total_chunks         = total_chunks
+        self.total_frames         = total_frames
+        self.completed_frames     = completed_frames
+        self.current_chunk        = 0
         self.current_chunk_frames = 0
-        self.start_time        = time.time()
-        self.chunk_start_time  = time.time()
-        self._progress: Progress | None = None
-        self._live: Live | None = None
-        self._overall_task     = None
-        self._chunk_task       = None
-        self._phase_text       = Text("  Phase: Initializing", style="bold cyan")
+        self.start_time           = time.time()
+        self.chunk_start_time     = time.time()
+        self._progress            = None
+        self._live                = None
+        self._overall_task        = None
+        self._chunk_task          = None
+        self._phase_text          = Text("  Phase: Initializing", style="bold cyan")
+        self.on_progress          = on_progress  # (overall_done, total, chunk_done, chunk_total, fps)
+        self.on_phase             = on_phase     # (phase_str)
 
     def set_phase(self, phase: str):
         self._phase_text = Text(f"  Phase: {phase}", style="bold cyan")
-        if self._live is not None:
+        if self.on_phase:
+            self.on_phase(phase)
+        elif self._live is not None:
             self._live.update(Group(self._phase_text, self._progress))
 
     def start(self):
-        self._progress = _make_progress()
+        if self.on_progress:
+            return  # GUI drives its own display
+        self._progress     = _make_progress()
         self._overall_task = self._progress.add_task(
-            "Overall",
-            total=self.total_frames,
-            completed=self.completed_frames,
-            fps=0.0,
+            "Overall", total=self.total_frames,
+            completed=self.completed_frames, fps=0.0,
         )
         self._chunk_task = self._progress.add_task(
-            "Chunk -/-",
-            total=1,
-            completed=0,
-            fps=0.0,
+            "Chunk -/-", total=1, completed=0, fps=0.0,
         )
         self._live = Live(
             Group(self._phase_text, self._progress),
-            console=console,
-            refresh_per_second=10,
+            console=console, refresh_per_second=10,
         )
         self._live.start()
         self._live.console.print("  [dim]Q + Enter = clean exit    F + Enter = forced exit[/dim]")
@@ -373,16 +395,19 @@ class ProgressTracker:
         pass
 
     def render(self, chunk_frames_done: int, chunk_total: int):
-        if self._progress is None or self._live is None:
-            return
         now           = time.time()
         elapsed_total = now - self.start_time
         overall_done  = self.completed_frames + chunk_frames_done
         overall_fps   = overall_done / elapsed_total if elapsed_total > 0 and overall_done > 0 else 0.0
         chunk_elapsed = now - self.chunk_start_time
         chunk_fps     = chunk_frames_done / chunk_elapsed if chunk_elapsed > 0 and chunk_frames_done > 0 else 0.0
-        self._progress.update(self._overall_task, completed=overall_done, fps=overall_fps)
-        self._progress.update(self._chunk_task,   completed=chunk_frames_done, fps=chunk_fps)
+
+        if self.on_progress:
+            self.on_progress(overall_done, self.total_frames,
+                             chunk_frames_done, chunk_total, overall_fps)
+        elif self._progress is not None and self._live is not None:
+            self._progress.update(self._overall_task, completed=overall_done, fps=overall_fps)
+            self._progress.update(self._chunk_task,   completed=chunk_frames_done, fps=chunk_fps)
 
     def stop(self):
         if self._live is not None:
@@ -391,22 +416,19 @@ class ProgressTracker:
             self._progress = None
 
 # ─── Output validation ────────────────────────────────────────────────────────
-DURATION_TOLERANCE   = 2.0
-MIN_SIZE_RATIO       = 0.10    # output must be at least 10% the size of the source
-FILE_STABLE_POLL     = 2.0     # seconds between file size polls to confirm write is complete
+DURATION_TOLERANCE = 2.0
+MIN_SIZE_RATIO     = 0.10
+FILE_STABLE_POLL   = 2.0
 
 def _has_audio_stream(path: Path) -> bool:
-    """Return True if the file has at least one audio stream."""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a",
-         "-show_entries", "stream=codec_type",
-         "-of", "csv=p=0", str(path)],
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
         capture_output=True, text=True,
     )
     return bool(result.stdout.strip())
 
 def _file_is_stable(path: Path, poll_seconds: float = FILE_STABLE_POLL) -> bool:
-    """Return True if file size does not change over poll_seconds."""
     try:
         size1 = path.stat().st_size
         time.sleep(poll_seconds)
@@ -416,7 +438,7 @@ def _file_is_stable(path: Path, poll_seconds: float = FILE_STABLE_POLL) -> bool:
         return False
 
 def validate_output(output: Path, source: Path) -> tuple[bool, str]:
-    """Basic duration-only validation used during normal chunk processing."""
+    """Basic duration-only validation used during normal processing."""
     if not output.exists():
         return False, "output file does not exist"
     source_duration = get_video_duration(source)
@@ -438,12 +460,8 @@ def validate_output_extended(output: Path, source: Path) -> tuple[bool, str]:
     Checks: existence, file stability, duration, audio stream, minimum size."""
     if not output.exists():
         return False, "output file does not exist"
-
-    # File must not still be written to
     if not _file_is_stable(output):
         return False, "output file size is still changing — likely incomplete"
-
-    # Duration check
     source_duration = get_video_duration(source)
     output_duration = get_video_duration(output)
     if source_duration <= 0:
@@ -456,12 +474,8 @@ def validate_output_extended(output: Path, source: Path) -> tuple[bool, str]:
             f"duration mismatch: source={source_duration:.2f}s "
             f"output={output_duration:.2f}s diff={diff:.2f}s"
         )
-
-    # Audio stream check — only if source has audio
     if _has_audio_stream(source) and not _has_audio_stream(output):
         return False, "output is missing audio stream present in source"
-
-    # Minimum file size check
     try:
         source_size = source.stat().st_size
         output_size = output.stat().st_size
@@ -472,7 +486,6 @@ def validate_output_extended(output: Path, source: Path) -> tuple[bool, str]:
             )
     except OSError as e:
         return False, f"could not read file sizes: {e}"
-
     return True, "ok"
 
 # ─── Split ────────────────────────────────────────────────────────────────────
@@ -484,63 +497,55 @@ def split_video(input_path: Path, work_dir: Path) -> list[Path]:
         "-c", "copy", "-map", "0",
         "-segment_time", str(CHUNK_DURATION),
         "-f", "segment", "-reset_timestamps", "1",
+        "-segment_start_number", "1",
         str(chunk_pattern),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        log.error(f"ffmpeg split failed:\n{result.stderr}")
-        sys.exit(1)
+        raise RuntimeError(f"ffmpeg split failed:\n{result.stderr}")
     chunks = sorted(work_dir.glob("chunk_*.mp4"))
     log.info(f"Created {len(chunks)} chunk(s).")
     return chunks
 
 # ─── Downscale / Upscale ──────────────────────────────────────────────────────
 def parse_resolution(res_str: str) -> int:
-    """Parse a resolution string like '720p' into an integer height."""
     res_str = res_str.strip().lower().rstrip('p')
     try:
         return int(res_str)
     except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"Invalid resolution: '{res_str}'. Use formats like 720p, 540p, 480p."
-        )
+        raise ValueError(f"Invalid resolution: '{res_str}'. Use formats like 720p, 540p, 480p.")
 
-def downscale_video(input_path: Path, output_path: Path, target_height: int):
+def downscale_video(input_path: Path, output_path: Path, target_height: int, on_progress=None):
     log.info(f"Downscaling to {target_height}p -> {output_path.name}...")
-    total_frames = get_video_frames(input_path)
+    total_frames   = get_video_frames(input_path)
     orig_w, orig_h = get_video_resolution(input_path)
-    target_width = (orig_w * target_height // orig_h) & ~1  # keep aspect ratio, ensure even
+    target_width   = (orig_w * target_height // orig_h) & ~1
     log.info("Using AMF (h264_amf) for downscale.")
     cmd = [
-        FFMPEG,
-        "-i", str(input_path),
+        FFMPEG, "-i", str(input_path),
         "-vf", f"vpp_amf=w={target_width}:h={target_height}",
-        "-c:v", "h264_amf",
-        "-c:a", "copy",
+        "-c:v", "h264_amf", "-c:a", "copy",
         "-y", str(output_path),
     ]
-    ffmpeg_with_progress(cmd, total_frames, "Downscale")
+    ffmpeg_with_progress(cmd, total_frames, "Downscale", on_progress=on_progress)
     log.info("Downscale complete.")
 
-def upscale_video(input_path: Path, output_path: Path, target_width: int, target_height: int):
+def upscale_video(input_path: Path, output_path: Path, target_width: int, target_height: int,
+                  on_progress=None):
     log.info(f"Upscaling to {target_width}x{target_height} -> {output_path.name}...")
     total_frames = get_video_frames(input_path)
     log.info("Using AMF (hevc_amf) for upscale.")
     cmd = [
-        FFMPEG,
-        "-i", str(input_path),
+        FFMPEG, "-i", str(input_path),
         "-vf", f"vpp_amf=w={target_width}:h={target_height}",
-        "-c:v", "hevc_amf",
-        "-quality", "quality",
-        "-c:a", "copy",
-        "-y", str(output_path),
+        "-c:v", "hevc_amf", "-quality", "quality",
+        "-c:a", "copy", "-y", str(output_path),
     ]
-    ffmpeg_with_progress(cmd, total_frames, "Upscale ")
+    ffmpeg_with_progress(cmd, total_frames, "Upscale ", on_progress=on_progress)
     log.info("Upscale complete.")
 
 # ─── Run lada-cli ─────────────────────────────────────────────────────────────
 def _kill_proc(proc: subprocess.Popen):
-    """Terminate then force-kill a process."""
     try:
         proc.terminate()
         proc.wait(timeout=10)
@@ -551,16 +556,13 @@ def _kill_proc(proc: subprocess.Popen):
 def run_lada(chunk: Path, output: Path, work_dir: Path, extra_args: list,
              tracker: ProgressTracker, chunk_idx: int, chunk_frames: int) -> tuple[bool, list, bool]:
     """Run lada-cli on a single chunk.
-    Returns (success, error_lines, timed_out_at_100).
-    timed_out_at_100=True means the process was killed after the audio mux timeout —
-    caller should run extended validation on the output before deciding to retry."""
+    Returns (success, error_lines, timed_out_at_100)."""
     global QUIT_CLEAN, QUIT_FORCE
 
     lada_cmd = [
         str(LADA_CLI),
-        "--input",                str(chunk),
-        "--output",               str(output),
-        "--temporary-directory",  str(work_dir),
+        "--input", str(chunk), "--output", str(output),
+        "--temporary-directory", str(work_dir),
     ] + LADA_FIXED_ARGS + extra_args
 
     tracker.start_chunk(chunk_idx, chunk_frames)
@@ -568,17 +570,14 @@ def run_lada(chunk: Path, output: Path, work_dir: Path, extra_args: list,
 
     try:
         proc = subprocess.Popen(
-            lada_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            lada_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
 
         frame_re        = re.compile(r"Processed:\s*[\d:]+\s*\((\d+)f\)")
         error_lines     = []
         frames_done     = 0
-        frames_complete = False   # True once frames_done >= chunk_frames
-        complete_time   = None    # wall time when frames first hit 100%
+        frames_complete = False
+        complete_time   = None
 
         for line in proc.stdout:
             if QUIT_FORCE:
@@ -588,10 +587,8 @@ def run_lada(chunk: Path, output: Path, work_dir: Path, extra_args: list,
                 _kill_proc(proc)
                 return False, error_lines, False
 
-            # Post-100% audio mux timeout check
             if frames_complete and complete_time is not None:
-                elapsed_since_complete = time.time() - complete_time
-                if elapsed_since_complete >= AUDIO_MUX_TIMEOUT:
+                if time.time() - complete_time >= AUDIO_MUX_TIMEOUT:
                     log.warning(
                         f"Chunk {chunk_idx}: lada-cli still running {AUDIO_MUX_TIMEOUT}s "
                         f"after frames completed — possible audio mux hang. Killing process."
@@ -617,12 +614,110 @@ def run_lada(chunk: Path, output: Path, work_dir: Path, extra_args: list,
                     error_lines.append(line)
 
         proc.wait()
+        if error_lines:
+            for err in error_lines[-5:]:
+                log.error(err)
+        return proc.returncode == 0, error_lines, False
+
+    except KeyboardInterrupt:
+        proc.kill()
+        proc.wait()
+        log.info("Interrupted.")
+        return False, [], False
+    except Exception as e:
+        log.error(f"Exception running lada-cli: {e}")
+        return False, [], False
+
+def run_lada_nochunk(input_path: Path, output_path: Path, work_dir: Path,
+                     extra_args: list, total_frames: int,
+                     on_progress=None, on_phase=None) -> tuple[bool, list, bool]:
+    """Run lada-cli on the full file (no chunking).
+    Returns (success, error_lines, timed_out_at_100).
+    on_progress(frames_done, total_frames, fps) and on_phase(phase) are optional GUI callbacks."""
+    global QUIT_CLEAN, QUIT_FORCE
+
+    lada_cmd = [
+        str(LADA_CLI),
+        "--input", str(input_path), "--output", str(output_path),
+        "--temporary-directory", str(work_dir),
+    ] + LADA_FIXED_ARGS + extra_args
+
+    frame_re        = re.compile(r"Processed:\s*[\d:]+\s*\((\d+)f\)")
+    error_lines     = []
+    frames_done     = 0
+    frames_complete = False
+    complete_time   = None
+    start_time      = time.time()
+
+    # Progress/task refs used in CLI mode only
+    _cli_progress      = None
+    _cli_progress_task = None
+
+    def _process_line(line: str):
+        nonlocal frames_done, frames_complete, complete_time, error_lines
+        m = frame_re.search(line)
+        if m:
+            frames_done = int(m.group(1))
+            elapsed     = time.time() - start_time
+            fps         = frames_done / elapsed if elapsed > 0 and frames_done > 0 else 0.0
+            if on_progress:
+                on_progress(frames_done, total_frames, fps)
+            elif _cli_progress is not None:
+                _cli_progress.update(_cli_progress_task, completed=frames_done, fps=fps)
+            if not frames_complete and total_frames > 0 and frames_done >= total_frames:
+                frames_complete = True
+                complete_time   = time.time()
+                log.info(f"Frames complete, waiting up to {AUDIO_MUX_TIMEOUT}s for audio mux...")
+        else:
+            file_logger.debug(line)
+            if any(x in line.lower() for x in ["error", "exception", "traceback", "crashed", "out of memory"]):
+                error_lines.append(line)
+
+    def _run_loop(proc) -> tuple[bool, bool]:
+        for line in proc.stdout:
+            if QUIT_FORCE:
+                _kill_proc(proc)
+                return False, False
+            if QUIT_CLEAN:
+                _kill_proc(proc)
+                return False, False
+            if frames_complete and complete_time is not None:
+                if time.time() - complete_time >= AUDIO_MUX_TIMEOUT:
+                    log.warning(
+                        f"lada-cli still running {AUDIO_MUX_TIMEOUT}s after frames completed "
+                        f"— possible audio mux hang. Killing process."
+                    )
+                    _kill_proc(proc)
+                    return False, True
+            line = line.strip()
+            if line:
+                _process_line(line)
+        proc.wait()
+        return proc.returncode == 0, False
+
+    try:
+        proc = subprocess.Popen(
+            lada_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+
+        if on_progress:
+            if on_phase:
+                on_phase("Processing (no-chunk)")
+            success, timed_out = _run_loop(proc)
+        else:
+            _cli_progress      = _make_progress()
+            _cli_progress_task = _cli_progress.add_task("Processing", total=total_frames, fps=0.0)
+            with Live(
+                Group(Text("  Phase: Processing (no-chunk)", style="bold cyan"), _cli_progress),
+                console=console, refresh_per_second=10,
+            ):
+                console.print("  [dim]Q + Enter = clean exit    F + Enter = forced exit[/dim]")
+                success, timed_out = _run_loop(proc)
 
         if error_lines:
             for err in error_lines[-5:]:
                 log.error(err)
-
-        return proc.returncode == 0, error_lines, False
+        return success, error_lines, timed_out
 
     except KeyboardInterrupt:
         proc.kill()
@@ -639,25 +734,17 @@ def concatenate(restored_chunks: list, output: Path, work_dir: Path):
     concat_file = work_dir / "concat.txt"
     with open(concat_file, "w") as f:
         for chunk in restored_chunks:
-            # ffmpeg concat requires forward slashes or escaped backslashes
             f.write(f"file '{str(chunk).replace(chr(92), '/')}'\n")
-    cmd = [
-        FFMPEG, "-f", "concat", "-safe", "0",
-        "-i", str(concat_file), "-c", "copy", str(output),
-    ]
+    cmd = [FFMPEG, "-f", "concat", "-safe", "0",
+           "-i", str(concat_file), "-c", "copy", str(output)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        log.error(f"ffmpeg concat failed:\n{result.stderr}")
-        sys.exit(1)
+        raise RuntimeError(f"ffmpeg concat failed:\n{result.stderr}")
     log.info(f"Output saved to: {output}")
 
 # ─── Output path resolution ───────────────────────────────────────────────────
-def resolve_output_path(
-    input_path: Path,
-    output: str | None,
-    output_dir: str | None,
-    output_pattern: str | None,
-) -> Path:
+def resolve_output_path(input_path: Path, output: str | None,
+                         output_dir: str | None, output_pattern: str | None) -> Path:
     if output:
         return Path(output)
     pattern  = output_pattern or OUTPUT_PATTERN_DEFAULT
@@ -665,101 +752,42 @@ def resolve_output_path(
     filename = stem + input_path.suffix
     return Path(output_dir) / filename
 
+# ─── Job options ──────────────────────────────────────────────────────────────
+class JobOptions:
+    """Carries all processing options for a single file.
+    Used by both CLI (built from argparse args) and GUI (built from form values)."""
+    def __init__(
+        self,
+        no_chunk:       bool       = False,
+        pre_downscale:  str | None = None,
+        output_res:     str | None = None,
+        skip_upscale:   bool       = False,
+        delete_input:   bool       = False,
+        shutdown_after: bool       = False,
+        extra_args:     list       | None = None,
+    ):
+        self.no_chunk       = no_chunk
+        self.pre_downscale  = pre_downscale
+        self.output_res     = output_res
+        self.skip_upscale   = skip_upscale
+        self.delete_input   = delete_input
+        self.shutdown_after = shutdown_after
+        self.extra_args     = extra_args or []
+
 # ─── No-chunk processing ──────────────────────────────────────────────────────
-def run_lada_nochunk(input_path: Path, output_path: Path, work_dir: Path,
-                     extra_args: list, total_frames: int) -> tuple[bool, list, bool]:
-    """Run lada-cli on the full file (no chunking).
-    Returns (success, error_lines, timed_out_at_100)."""
+def process_file_nochunk(input_path: Path, output_path: Path, opts: JobOptions,
+                          on_progress=None, on_phase=None, on_log=None) -> bool:
+    """Process a single input file without chunking. Returns True on success.
+    Callbacks (all optional, used by GUI):
+      on_progress(frames_done, total_frames)
+      on_phase(phase_str)
+      on_log(message)"""
     global QUIT_CLEAN, QUIT_FORCE
 
-    lada_cmd = [
-        str(LADA_CLI),
-        "--input",               str(input_path),
-        "--output",              str(output_path),
-        "--temporary-directory", str(work_dir),
-    ] + LADA_FIXED_ARGS + extra_args
-
-    progress        = _make_progress()
-    task            = progress.add_task("Processing", total=total_frames, fps=0.0)
-    start_time      = time.time()
-    frame_re        = re.compile(r"Processed:\s*[\d:]+\s*\((\d+)f\)")
-    error_lines     = []
-    frames_done     = 0
-    frames_complete = False
-    complete_time   = None
-
-    try:
-        proc = subprocess.Popen(
-            lada_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-
-        with Live(
-            Group(Text("  Phase: Processing (no-chunk)", style="bold cyan"), progress),
-            console=console,
-            refresh_per_second=10,
-        ):
-            console.print("  [dim]Q + Enter = clean exit    F + Enter = forced exit[/dim]")
-            for line in proc.stdout:
-                if QUIT_FORCE:
-                    _kill_proc(proc)
-                    return False, error_lines, False
-                if QUIT_CLEAN:
-                    _kill_proc(proc)
-                    return False, error_lines, False
-
-                # Post-100% audio mux timeout check
-                if frames_complete and complete_time is not None:
-                    if time.time() - complete_time >= AUDIO_MUX_TIMEOUT:
-                        log.warning(
-                            f"lada-cli still running {AUDIO_MUX_TIMEOUT}s after frames completed "
-                            f"— possible audio mux hang. Killing process."
-                        )
-                        _kill_proc(proc)
-                        return False, error_lines, True
-
-                line = line.strip()
-                if not line:
-                    continue
-
-                m = frame_re.search(line)
-                if m:
-                    frames_done = int(m.group(1))
-                    elapsed     = time.time() - start_time
-                    fps         = frames_done / elapsed if elapsed > 0 and frames_done > 0 else 0.0
-                    progress.update(task, completed=frames_done, fps=fps)
-                    if not frames_complete and total_frames > 0 and frames_done >= total_frames:
-                        frames_complete = True
-                        complete_time   = time.time()
-                        log.info(f"Frames complete, waiting up to {AUDIO_MUX_TIMEOUT}s for audio mux...")
-                else:
-                    file_logger.debug(line)
-                    if any(x in line.lower() for x in ["error", "exception", "traceback", "crashed", "out of memory"]):
-                        error_lines.append(line)
-
-        proc.wait()
-
-        if error_lines:
-            for err in error_lines[-5:]:
-                log.error(err)
-
-        return proc.returncode == 0, error_lines, False
-
-    except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
-        log.info("Interrupted.")
-        return False, [], False
-    except Exception as e:
-        log.error(f"Exception running lada-cli: {e}")
-        return False, [], False
-
-
-def process_file_nochunk(input_path: Path, output_path: Path, args, extra_args: list) -> bool:
-    """Process a single input file without chunking. Returns True on success."""
-    global QUIT_CLEAN, QUIT_FORCE
+    def _log(msg):
+        log.info(msg)
+        if on_log:
+            on_log(msg)
 
     if not input_path.exists():
         log.error(f"Input file not found: {input_path}")
@@ -773,25 +801,23 @@ def process_file_nochunk(input_path: Path, output_path: Path, args, extra_args: 
     log_file   = STATE_DIR / f"{job_id}.log"
 
     setup_job_logging(log_file)
-    log.info(f"Job ID: {job_id} ({input_path.name}) [no-chunk mode]")
-    log.info(f"lada-cli: {LADA_CLI}")
-    log.info(f"ffmpeg:   {FFMPEG}")
-    log.info("Press Q + Enter for clean exit, F + Enter for forced exit.")
+    _log(f"Job ID: {job_id} ({input_path.name}) [no-chunk mode]")
+    _log(f"lada-cli: {LADA_CLI}")
+    _log(f"ffmpeg:   {FFMPEG}")
 
     state    = load_state(state_file)
     resuming = bool(state)
 
     if resuming and state.get("done"):
-        log.info(f"Skipping already completed job for: {input_path.name}")
+        _log(f"Skipping already completed job for: {input_path.name}")
         return True
 
     if resuming:
-        log.info(f"Resuming previous (failed) no-chunk job for: {input_path.name}")
+        _log(f"Resuming previous (failed) no-chunk job for: {input_path.name}")
 
     work_dir = TEMP_BASE / f"lada_{job_id}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Downscale if requested ─────────────────────────────────────────────────
     source_to_process   = input_path
     original_resolution = None
     target_height       = None
@@ -803,69 +829,64 @@ def process_file_nochunk(input_path: Path, output_path: Path, args, extra_args: 
         input_duration      = get_video_duration(input_path)
         downscaled_duration = get_video_duration(downscaled_path) if downscaled_path.exists() else 0.0
         if abs(input_duration - downscaled_duration) > DURATION_TOLERANCE:
-            log.warning("Downscaled file is missing or incomplete. Re-running downscale...")
-            console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
-            downscale_video(input_path, downscaled_path, target_height)
+            log.warning("Downscaled file missing or incomplete. Re-running downscale...")
+            if on_phase: on_phase("Downscaling")
+            else: console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
+            downscale_video(input_path, downscaled_path, target_height, on_progress=on_progress)
         source_to_process = downscaled_path
-    elif args.pre_downscale and not resuming:
-        target_height  = parse_resolution(args.pre_downscale)
+    elif opts.pre_downscale and not resuming:
+        target_height  = parse_resolution(opts.pre_downscale)
         orig_w, orig_h = get_video_resolution(input_path)
         if orig_h <= target_height:
-            log.warning(
-                f"Input resolution ({orig_h}p) is already <= target ({target_height}p). Skipping downscale."
-            )
+            log.warning(f"Input resolution ({orig_h}p) is already <= target ({target_height}p). Skipping downscale.")
         else:
             original_resolution = (orig_w, orig_h)
             downscaled_path     = work_dir / "input_downscaled.mp4"
-            console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
-            downscale_video(input_path, downscaled_path, target_height)
+            if on_phase: on_phase("Downscaling")
+            else: console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
+            downscale_video(input_path, downscaled_path, target_height, on_progress=on_progress)
             source_to_process = downscaled_path
 
-    # Save state before starting
     if not resuming:
         state = {
-            "input":                   str(input_path),
-            "output":                  str(output_path),
-            "work_dir":                str(work_dir),
-            "no_chunk":                True,
-            "original_resolution":     list(original_resolution) if original_resolution else None,
+            "input": str(input_path), "output": str(output_path),
+            "work_dir": str(work_dir), "no_chunk": True,
+            "original_resolution": list(original_resolution) if original_resolution else None,
             "downscale_target_height": target_height if original_resolution else None,
-            "done":                    False,
+            "done": False,
         }
         save_state(state_file, state)
 
-    # ── Run lada-cli on the full file ──────────────────────────────────────────
-    listener = Thread(target=keypress_listener, daemon=True)
-    listener.start()
-
-    log.info(f"Total frames: {fmt_frames(get_video_frames(source_to_process))}")
-
-    # lada-cli writes its output directly; use a temp path if upscale is needed
-    if original_resolution and not args.skip_upscale:
-        lada_output = work_dir / "output_pre_upscale.mp4"
-    else:
-        lada_output = output_path
+    if not on_progress:
+        Thread(target=keypress_listener, daemon=True).start()
 
     total_frames = get_video_frames(source_to_process)
+    _log(f"Total frames: {fmt_frames(total_frames)}")
+
+    lada_output = (work_dir / "output_pre_upscale.mp4"
+                   if original_resolution and not opts.skip_upscale else output_path)
+
     success, error_lines, timed_out = run_lada_nochunk(
-        source_to_process, lada_output, work_dir, extra_args, total_frames
+        source_to_process, lada_output, work_dir, opts.extra_args,
+        total_frames, on_progress=on_progress, on_phase=on_phase,
     )
 
     if QUIT_CLEAN or QUIT_FORCE:
-        quit_type = "Clean" if QUIT_CLEAN else "Forced"
-        log.info(f"{quit_type} exit requested.")
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="bold")
-        table.add_column()
-        table.add_row("Status:", "Interrupted — job can be retried")
-        console.print(Panel(table, title="Exit summary", border_style="dim"))
-        sys.exit(0)
+        _log("Clean" if QUIT_CLEAN else "Forced" + " exit requested.")
+        if not on_progress:
+            table = Table.grid(padding=(0, 2))
+            table.add_column(style="bold")
+            table.add_column()
+            table.add_row("Status:", "Interrupted — job can be retried")
+            console.print(Panel(table, title="Exit summary", border_style="dim"))
+            sys.exit(0)
+        return False
 
     if timed_out:
         log.warning("lada-cli timed out after frames complete — running extended validation.")
         valid, reason = validate_output_extended(lada_output, source_to_process)
         if valid:
-            log.info("Extended validation passed — treating as success.")
+            _log("Extended validation passed — treating as success.")
         else:
             log.error(f"Extended validation failed — {reason}")
             lada_output.unlink(missing_ok=True)
@@ -874,45 +895,51 @@ def process_file_nochunk(input_path: Path, output_path: Path, args, extra_args: 
         log.error("lada-cli failed. Job can be retried by re-running with the same arguments.")
         return False
     else:
-        # Normal completion — run standard validation
         valid, reason = validate_output(lada_output, source_to_process)
         if not valid:
             log.error(f"Output validation failed — {reason}")
             lada_output.unlink(missing_ok=True)
             return False
 
-    # ── Upscale if needed ──────────────────────────────────────────────────────
-    if original_resolution and not args.skip_upscale:
-        if args.output_res:
-            out_w, out_h = [int(x) for x in args.output_res.split("x")]
+    if original_resolution and not opts.skip_upscale:
+        if opts.output_res:
+            out_w, out_h = [int(x) for x in opts.output_res.split("x")]
         else:
             out_w, out_h = original_resolution[0], original_resolution[1]
-        console.print("  [bold cyan]Phase: Upscaling[/bold cyan]")
-        upscale_video(lada_output, output_path, out_w, out_h)
+        if on_phase: on_phase("Upscaling")
+        else: console.print("  [bold cyan]Phase: Upscaling[/bold cyan]")
+        upscale_video(lada_output, output_path, out_w, out_h, on_progress=on_progress)
 
-    # ── Cleanup ────────────────────────────────────────────────────────────────
-    log.info("Cleaning up temporary files...")
+    _log("Cleaning up temporary files...")
     shutil.rmtree(work_dir)
     state["done"] = True
     save_state(state_file, state)
     state_file.unlink(missing_ok=True)
+    _log("Done.")
 
-    log.info("Done.")
-
-    if args.delete_input:
+    if opts.delete_input:
         try:
             input_path.unlink()
-            log.info(f"Deleted original input file: {input_path}")
+            _log(f"Deleted original input file: {input_path}")
         except Exception as e:
             log.warning(f"Could not delete input file: {e}")
 
     return True
 
-
-# ─── Per-file processing ──────────────────────────────────────────────────────
-def process_file(input_path: Path, output_path: Path, args, extra_args: list) -> bool:
-    """Process a single input file. Returns True on success, False on failure."""
+# ─── Per-file processing (chunked) ───────────────────────────────────────────
+def process_file(input_path: Path, output_path: Path, opts: JobOptions,
+                 on_progress=None, on_phase=None, on_log=None) -> bool:
+    """Process a single input file with chunking. Returns True on success.
+    Callbacks (all optional, used by GUI):
+      on_progress(overall_done, total_frames, chunk_done, chunk_total, fps)
+      on_phase(phase_str)
+      on_log(message)"""
     global QUIT_CLEAN, QUIT_FORCE
+
+    def _log(msg):
+        log.info(msg)
+        if on_log:
+            on_log(msg)
 
     if not input_path.exists():
         log.error(f"Input file not found: {input_path}")
@@ -920,46 +947,45 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    job_id    = input_hash(input_path)
+    job_id     = input_hash(input_path)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     state_file = STATE_DIR / f"{job_id}.json"
     log_file   = STATE_DIR / f"{job_id}.log"
 
     setup_job_logging(log_file)
-    log.info(f"Job ID: {job_id} ({input_path.name})")
-    log.info(f"lada-cli: {LADA_CLI}")
-    log.info(f"ffmpeg:   {FFMPEG}")
-    log.info("Press Q + Enter for clean exit, F + Enter for forced exit.")
+    _log(f"Job ID: {job_id} ({input_path.name})")
+    _log(f"lada-cli: {LADA_CLI}")
+    _log(f"ffmpeg:   {FFMPEG}")
 
     state    = load_state(state_file)
     resuming = bool(state)
 
     if resuming and state.get("done"):
-        log.info(f"Skipping already completed job for: {input_path.name}")
+        _log(f"Skipping already completed job for: {input_path.name}")
         return True
 
     if resuming:
-        log.info(f"Resuming previous job for: {input_path.name}")
-        work_dir           = Path(state["work_dir"])
-        chunks             = [Path(c) for c in state["chunks"]]
-        chunk_frames       = state["chunk_frames"]
-        completed          = set(state.get("completed", []))
-        failed             = set(state.get("failed", []))
+        _log(f"Resuming previous job for: {input_path.name}")
+        work_dir            = Path(state["work_dir"])
+        chunks              = [Path(c) for c in state["chunks"]]
+        chunk_frames        = state["chunk_frames"]
+        completed           = set(state.get("completed", []))
+        failed              = set(state.get("failed", []))
         original_resolution = tuple(state["original_resolution"]) if state.get("original_resolution") else None
 
-        # Validate downscaled file if this job used --pre-downscale
         if original_resolution:
-            downscaled_path    = work_dir / "input_downscaled.mp4"
-            input_duration     = get_video_duration(input_path)
+            downscaled_path     = work_dir / "input_downscaled.mp4"
+            input_duration      = get_video_duration(input_path)
             downscaled_duration = get_video_duration(downscaled_path) if downscaled_path.exists() else 0.0
             if abs(input_duration - downscaled_duration) > DURATION_TOLERANCE:
-                log.warning("Downscaled file is missing or incomplete. Re-running downscale...")
+                log.warning("Downscaled file missing or incomplete. Re-running downscale...")
                 target_height = state.get("downscale_target_height", 720)
-                console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
-                downscale_video(input_path, downscaled_path, target_height)
-                log.info("Re-downscale complete. Resuming chunk processing.")
+                if on_phase: on_phase("Downscaling")
+                else: console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
+                downscale_video(input_path, downscaled_path, target_height, on_progress=on_progress)
+                _log("Re-downscale complete. Resuming chunk processing.")
     else:
-        log.info(f"Starting new job for: {input_path.name}")
+        _log(f"Starting new job for: {input_path.name}")
         work_dir = TEMP_BASE / f"lada_{job_id}"
         work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -967,64 +993,69 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
         original_resolution = None
         target_height       = None
 
-        if args.pre_downscale:
-            target_height = parse_resolution(args.pre_downscale)
+        if opts.pre_downscale:
+            target_height  = parse_resolution(opts.pre_downscale)
             orig_w, orig_h = get_video_resolution(input_path)
             if orig_h <= target_height:
-                log.warning(
-                    f"Input resolution ({orig_h}p) is already <= target ({target_height}p). Skipping downscale."
-                )
+                log.warning(f"Input resolution ({orig_h}p) is already <= target ({target_height}p). Skipping downscale.")
             else:
                 original_resolution = (orig_w, orig_h)
                 downscaled_path     = work_dir / "input_downscaled.mp4"
                 input_duration      = get_video_duration(input_path)
                 downscaled_duration = get_video_duration(downscaled_path) if downscaled_path.exists() else 0.0
                 if abs(input_duration - downscaled_duration) <= DURATION_TOLERANCE:
-                    log.info("Existing downscaled file is valid. Skipping downscale.")
+                    _log("Existing downscaled file is valid. Skipping downscale.")
                 else:
-                    console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
-                    downscale_video(input_path, downscaled_path, target_height)
+                    if on_phase: on_phase("Downscaling")
+                    else: console.print("  [bold cyan]Phase: Downscaling[/bold cyan]")
+                    downscale_video(input_path, downscaled_path, target_height, on_progress=on_progress)
                 source_for_split = downscaled_path
 
-        chunks = split_video(source_for_split, work_dir)
-        log.info("Counting frames per chunk (this may take a moment)...")
+        try:
+            chunks = split_video(source_for_split, work_dir)
+        except RuntimeError as e:
+            log.error(str(e))
+            return False
+
+        _log("Counting frames per chunk (this may take a moment)...")
         chunk_frames = {str(c): get_video_frames(c) for c in chunks}
         completed    = set()
         failed       = set()
         state = {
-            "input":                str(input_path),
-            "output":               str(output_path),
-            "work_dir":             str(work_dir),
-            "chunks":               [str(c) for c in chunks],
-            "chunk_frames":         chunk_frames,
-            "completed":            [],
-            "failed":               [],
-            "original_resolution":  list(original_resolution) if original_resolution else None,
+            "input": str(input_path), "output": str(output_path),
+            "work_dir": str(work_dir),
+            "chunks": [str(c) for c in chunks],
+            "chunk_frames": chunk_frames,
+            "completed": [], "failed": [],
+            "original_resolution": list(original_resolution) if original_resolution else None,
             "downscale_target_height": target_height if original_resolution else None,
-            "done":                 False,
+            "done": False,
         }
         save_state(state_file, state)
 
-    total_frames  = sum(chunk_frames.values())
-    total_chunks  = len(chunks)
-    already_done  = sum(chunk_frames.get(c, 0) for c in completed)
-    tracker       = ProgressTracker(total_chunks, total_frames, already_done)
+    total_frames = sum(chunk_frames.values())
+    total_chunks = len(chunks)
+    already_done = sum(chunk_frames.get(c, 0) for c in completed)
+    tracker      = ProgressTracker(total_chunks, total_frames, already_done,
+                                   on_progress=on_progress, on_phase=on_phase)
 
-    log.info(f"Chunks: {total_chunks} | Total frames: {fmt_frames(total_frames)}")
-    log.info(f"Completed: {len(completed)} | Remaining: {total_chunks - len(completed) - len(failed)}")
+    _log(f"Chunks: {total_chunks} | Total frames: {fmt_frames(total_frames)}")
+    _log(f"Completed: {len(completed)} | Remaining: {total_chunks - len(completed) - len(failed)}")
 
-    listener = Thread(target=keypress_listener, daemon=True)
-    listener.start()
+    if not on_progress:
+        Thread(target=keypress_listener, daemon=True).start()
 
     def attempt(chunk: Path, restored: Path, idx: int, frames: int, attempt_num: int) -> bool:
-        exit_ok, error_lines, timed_out = run_lada(chunk, restored, work_dir, extra_args, tracker, idx, frames)
+        exit_ok, error_lines, timed_out = run_lada(
+            chunk, restored, work_dir, opts.extra_args, tracker, idx, frames
+        )
         if QUIT_CLEAN or QUIT_FORCE:
             return False
         if timed_out:
-            log.warning(f"Chunk {idx}/{total_chunks} attempt {attempt_num}: timed out after frames complete — running extended validation.")
+            log.warning(f"Chunk {idx}/{total_chunks} attempt {attempt_num}: timed out — running extended validation.")
             valid, reason = validate_output_extended(restored, chunk)
             if valid:
-                log.info(f"Chunk {idx}/{total_chunks}: extended validation passed — treating as success.")
+                _log(f"Chunk {idx}/{total_chunks}: extended validation passed — treating as success.")
                 return True
             log.error(f"Chunk {idx}/{total_chunks}: extended validation failed — {reason}")
             restored.unlink(missing_ok=True)
@@ -1049,16 +1080,16 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
         chunk_key = str(chunk)
 
         if chunk_key in completed:
-            log.info(f"Skipping already completed chunk {idx}/{total_chunks}: {chunk.name}")
+            _log(f"Skipping already completed chunk {idx}/{total_chunks}: {chunk.name}")
             continue
 
         restored = work_dir / f"restored_{chunk.name}"
-        log.info(f"Processing chunk {idx}/{total_chunks}: {chunk.name}")
+        _log(f"Processing chunk {idx}/{total_chunks}: {chunk.name}")
         frames = chunk_frames.get(chunk_key, 0)
         tracker.set_phase(f"Processing chunks ({idx}/{total_chunks})")
 
         if attempt(chunk, restored, idx, frames, 1):
-            log.info(f"Chunk {idx}/{total_chunks} completed.")
+            _log(f"Chunk {idx}/{total_chunks} completed.")
             tracker.complete_chunk(frames)
             completed.add(chunk_key)
             failed.discard(chunk_key)
@@ -1067,7 +1098,7 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
             restored.unlink(missing_ok=True)
             tracker.start_chunk(idx, frames)
             if attempt(chunk, restored, idx, frames, 2):
-                log.info(f"Chunk {idx}/{total_chunks} succeeded on retry.")
+                _log(f"Chunk {idx}/{total_chunks} succeeded on retry.")
                 tracker.complete_chunk(frames)
                 completed.add(chunk_key)
                 failed.discard(chunk_key)
@@ -1084,9 +1115,11 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
 
     if QUIT_CLEAN or QUIT_FORCE:
         quit_type = "Clean" if QUIT_CLEAN else "Forced"
-        log.info(f"{quit_type} exit requested.")
-        print_summary(chunks, completed, failed, tracker.start_time)
-        sys.exit(0)
+        _log(f"{quit_type} exit requested.")
+        if not on_progress:
+            print_summary(chunks, completed, failed, tracker.start_time)
+            sys.exit(0)
+        return False
 
     if not completed:
         log.error("No chunks completed successfully. Aborting.")
@@ -1100,96 +1133,92 @@ def process_file(input_path: Path, output_path: Path, args, extra_args: list) ->
         for chunk in chunks if str(chunk) in completed
     ]
 
-    if original_resolution:
-        if args.skip_upscale:
-            console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
-            concatenate(restored_chunks, output_path, work_dir)
-            log.info("Upscale skipped — output is at downscaled resolution.")
-        else:
-            console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
-            pre_upscale_path = work_dir / "output_pre_upscale.mp4"
-            concatenate(restored_chunks, pre_upscale_path, work_dir)
-            if args.output_res:
-                out_w, out_h = [int(x) for x in args.output_res.split("x")]
+    try:
+        if original_resolution:
+            if opts.skip_upscale:
+                if on_phase: on_phase("Concatenating")
+                else: console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
+                concatenate(restored_chunks, output_path, work_dir)
+                _log("Upscale skipped — output is at downscaled resolution.")
             else:
-                out_w, out_h = original_resolution[0], original_resolution[1]
-            console.print("  [bold cyan]Phase: Upscaling[/bold cyan]")
-            upscale_video(pre_upscale_path, output_path, out_w, out_h)
-    else:
-        console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
-        concatenate(restored_chunks, output_path, work_dir)
+                if on_phase: on_phase("Concatenating")
+                else: console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
+                pre_upscale_path = work_dir / "output_pre_upscale.mp4"
+                concatenate(restored_chunks, pre_upscale_path, work_dir)
+                out_w, out_h = (
+                    [int(x) for x in opts.output_res.split("x")]
+                    if opts.output_res else [original_resolution[0], original_resolution[1]]
+                )
+                if on_phase: on_phase("Upscaling")
+                else: console.print("  [bold cyan]Phase: Upscaling[/bold cyan]")
+                upscale_video(pre_upscale_path, output_path, out_w, out_h, on_progress=on_progress)
+        else:
+            if on_phase: on_phase("Concatenating")
+            else: console.print("  [bold cyan]Phase: Concatenating[/bold cyan]")
+            concatenate(restored_chunks, output_path, work_dir)
+    except RuntimeError as e:
+        log.error(str(e))
+        return False
 
-    log.info("Cleaning up temporary files...")
+    _log("Cleaning up temporary files...")
     shutil.rmtree(work_dir)
     state["done"] = True
     save_state(state_file, state)
     state_file.unlink(missing_ok=True)
+    _log("Done.")
 
-    log.info("Done.")
-
-    if args.delete_input and not failed:
+    if opts.delete_input and not failed:
         try:
             input_path.unlink()
-            log.info(f"Deleted original input file: {input_path}")
+            _log(f"Deleted original input file: {input_path}")
         except Exception as e:
             log.warning(f"Could not delete input file: {e}")
 
     return True
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ─── Main (CLI entry point) ───────────────────────────────────────────────────
 def main():
     global QUIT_CLEAN, QUIT_FORCE
 
     setup_logging()
+
+    if FFMPEG is None:
+        log.error(_FFMPEG_ERROR)
+        sys.exit(1)
 
     parser = argparse.ArgumentParser(
         description="Split, restore with lada-cli.exe, and concatenate video. (Windows native)",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    # Input — mutually exclusive
     input_group = parser.add_mutually_exclusive_group(required=False)
-    input_group.add_argument("-i", "--input",     help="Input video file")
-    input_group.add_argument("--input-dir",       help="Directory of .mp4 files to process sequentially")
+    input_group.add_argument("-i", "--input",   help="Input video file")
+    input_group.add_argument("--input-dir",     help="Directory of .mp4 files to process sequentially")
 
-    # Output
     parser.add_argument("-o", "--output",
                         help="Output video file path. Required with --input unless --output-dir is used.")
     parser.add_argument("--output-dir",
                         help="Output directory. Used with --output-pattern (or default pattern).")
-    parser.add_argument("-p", "--output-pattern", default=OUTPUT_PATTERN_DEFAULT,
-                        metavar="PATTERN",
+    parser.add_argument("-p", "--output-pattern", default=OUTPUT_PATTERN_DEFAULT, metavar="PATTERN",
                         help=f"Output filename pattern using {{orig_file_name}} as placeholder. "
-                             f"Extension is taken from the source file. "
                              f"Default: {OUTPUT_PATTERN_DEFAULT}")
-
+    parser.add_argument("--no-chunk", action="store_true",
+                        help="Skip splitting — process the whole video in one lada-cli call.")
     parser.add_argument("--pre-downscale", metavar="RESOLUTION", nargs="?", const="720p",
-                        type=str,
-                        help="Downscale input before processing (e.g. 720p, 540p, 480p). "
-                             "Defaults to 720p if no value given. Output upscaled back to original resolution.")
+                        help="Downscale input before processing (e.g. 720p, 540p). Defaults to 720p.")
     parser.add_argument("--output-res", metavar="WxH",
-                        help="Override the upscale output resolution (e.g. 1920x1080). "
-                             "Only valid when --pre-downscale is used.")
+                        help="Override upscale output resolution. Only valid with --pre-downscale.")
     parser.add_argument("--skip-upscale", action="store_true",
-                        help="Skip the upscale step after processing. "
-                             "Only valid when --pre-downscale is used.")
+                        help="Skip upscale step. Only valid with --pre-downscale.")
     parser.add_argument("--shutdown-after", action="store_true",
                         help=f"Shut down Windows after successful completion "
-                             f"(only between {SHUTDOWN_WINDOW_START:02d}:00–{SHUTDOWN_WINDOW_END:02d}:00, "
-                             f"with a {SHUTDOWN_COUNTDOWN//60}-minute countdown)")
+                             f"(only between {SHUTDOWN_WINDOW_START:02d}:00–{SHUTDOWN_WINDOW_END:02d}:00).")
     parser.add_argument("--delete-input", action="store_true",
-                        help="Delete the original input file after successful completion. "
-                             "Only applies when all chunks completed without failure.")
+                        help="Delete original input file after successful completion.")
     parser.add_argument("-r", "--remove-job", metavar="JOB_ID",
-                        help="Remove all temporary files and state for the given job ID. "
-                             "Standalone operation — no other flags required.")
-    parser.add_argument("--no-chunk", action="store_true",
-                        help="Skip splitting — process the whole video in one lada-cli call. "
-                             "Useful when the GPU can handle the full file without chunking. "
-                             "Compatible with --pre-downscale, --skip-upscale, --output-res.")
+                        help="Remove all temp files and state for a job. Standalone operation.")
     parser.add_argument("--args", metavar="LADA_ARGS", default="",
-                        help="Additional arguments to pass to lada-cli, as a single quoted string. "
-                             'Example: --args "--max-clip-length 60"')
+                        help='Additional arguments to pass to lada-cli. e.g. --args "--max-clip-length 60"')
 
     args       = parser.parse_args()
     extra_args = args.args.split() if args.args else []
@@ -1201,38 +1230,22 @@ def main():
         state_file = STATE_DIR  / f"{job_id}.json"
         log_file   = STATE_DIR  / f"{job_id}.log"
         found_any  = False
-
-        if work_dir.exists():
-            console.print(f"  Removing work directory: {work_dir}")
-            shutil.rmtree(work_dir)
-            found_any = True
-        else:
-            console.print(f"  Work directory not found (already clean): {work_dir}")
-
-        if state_file.exists():
-            console.print(f"  Removing state file: {state_file}")
-            state_file.unlink()
-            found_any = True
-        else:
-            console.print(f"  State file not found (already clean): {state_file}")
-
-        if log_file.exists():
-            console.print(f"  Removing log file: {log_file}")
-            log_file.unlink()
-            found_any = True
-        else:
-            console.print(f"  Log file not found (already clean): {log_file}")
-
-        if found_any:
-            console.print(f"\n  [green]Job {job_id} cleaned up.[/green]")
-        else:
-            console.print(f"\n  [yellow]No files found for job {job_id}.[/yellow]")
+        for path, label in [(work_dir, "work directory"), (state_file, "state file"), (log_file, "log file")]:
+            if path.exists():
+                console.print(f"  Removing {label}: {path}")
+                shutil.rmtree(path) if path.is_dir() else path.unlink()
+                found_any = True
+            else:
+                console.print(f"  {label.capitalize()} not found (already clean): {path}")
+        console.print(
+            f"\n  [green]Job {job_id} cleaned up.[/green]" if found_any
+            else f"\n  [yellow]No files found for job {job_id}.[/yellow]"
+        )
         sys.exit(0)
 
     # ── Validate flags ────────────────────────────────────────────────────────
     if not args.input and not args.input_dir:
         parser.error("one of the arguments --input/--input-dir is required.")
-
     if args.input:
         if not args.output and not args.output_dir:
             parser.error("--input requires either --output or --output-dir.")
@@ -1244,12 +1257,12 @@ def main():
         if not args.output_dir:
             parser.error("--input-dir requires --output-dir.")
         if args.output:
-            parser.error("--output cannot be used with --input-dir. Use --output-dir and --output-pattern instead.")
+            parser.error("--output cannot be used with --input-dir.")
     if args.output_pattern:
         if "--" in args.output_pattern:
-            parser.error("--output-pattern appears to contain a flag. Did you forget a space between arguments?")
+            parser.error("--output-pattern appears to contain a flag.")
         if "/" in args.output_pattern or "\\" in args.output_pattern:
-            parser.error("--output-pattern must be a filename stem, not a path. Use --output-dir for the directory.")
+            parser.error("--output-pattern must be a filename stem, not a path.")
     if args.skip_upscale and not args.pre_downscale:
         parser.error("--skip-upscale requires --pre-downscale.")
     if args.output_res:
@@ -1258,13 +1271,21 @@ def main():
         if args.skip_upscale:
             parser.error("--output-res and --skip-upscale cannot be used together.")
         if not re.fullmatch(r"\d+x\d+", args.output_res):
-            parser.error(f"--output-res must be in WxH format (e.g. 1920x1080), got: {args.output_res}")
-        try:
-            out_w, out_h = [int(x) for x in args.output_res.split("x")]
-            if out_w <= 0 or out_h <= 0:
-                raise ValueError
-        except ValueError:
-            parser.error(f"--output-res dimensions must be positive integers, got: {args.output_res}")
+            parser.error(f"--output-res must be in WxH format, got: {args.output_res}")
+        out_w, out_h = [int(x) for x in args.output_res.split("x")]
+        if out_w <= 0 or out_h <= 0:
+            parser.error("--output-res dimensions must be positive integers.")
+
+    # ── Build JobOptions ──────────────────────────────────────────────────────
+    opts = JobOptions(
+        no_chunk       = args.no_chunk,
+        pre_downscale  = args.pre_downscale,
+        output_res     = args.output_res,
+        skip_upscale   = args.skip_upscale,
+        delete_input   = args.delete_input,
+        shutdown_after = args.shutdown_after,
+        extra_args     = extra_args,
+    )
 
     # ── Collect input files ───────────────────────────────────────────────────
     if args.input:
@@ -1294,9 +1315,8 @@ def main():
             args.output_pattern,
         )
 
-        success = process_file_nochunk(input_path, output_path, args, extra_args) \
-                  if args.no_chunk else \
-                  process_file(input_path, output_path, args, extra_args)
+        fn      = process_file_nochunk if opts.no_chunk else process_file
+        success = fn(input_path, output_path, opts)
 
         if not success:
             log.error(f"Failed processing: {input_path.name}. Stopping.")
@@ -1305,7 +1325,7 @@ def main():
         QUIT_CLEAN = False
         QUIT_FORCE = False
 
-    if args.shutdown_after:
+    if opts.shutdown_after:
         maybe_shutdown()
 
 if __name__ == "__main__":
